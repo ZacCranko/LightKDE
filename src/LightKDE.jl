@@ -2,126 +2,130 @@ module LightKDE
 
 using Distributions, MLDataUtils
 
-abstract type AbstractKernel end
+const Kernel = ContinuousUnivariateDistribution
 
-eval_kernel(k::AbstractKernel, x, y) = k(x - y)
-eval_kernel(k::ContinuousMultivariateDistribution, x, y) = exp(sum(logpdf.(k, x - y)))
-
-lp_lognormalisation(inv_r, d::Int, p) = -d*(log(2) - log(inv_r) + lgamma(1 + 1/p)) + lgamma(1 + d/p)
-
-mutable struct Ball <: AbstractKernel
-    band::Real
-    p::Real
-
-    Ball(band, p = 2.0) = new(band, p) # all kernels must have a single argument constructor
+function eval_kernel(k::Kernel, x::T, y::U) where {T,U}
+    p = zero(promote_type(eltype(T), eltype(U)))
+    n = length(x)
+    @inbounds for i in Base.OneTo(n)
+        p += logpdf(k, x[i] - y[i])
+    end
+    return exp(p)
 end
 
-(b::Ball)(x) = norm(x / b.band, b.p) <= 1 ? 1 : 0
-_lognormalisation(k::Ball, ::Val{d}) where d = lp_lognormalisation(k.band, d, k.p)
-
-mutable struct Tophat <: AbstractKernel
-    band::Real
-end
-
-(t::Tophat)(x) = norm(x / t.band, Inf) <= 1 ? 1 : 0
-_lognormalisation(t::Tophat, ::Val{d}) = 1/(2pi)^(d-1) = lp_lognormalisation(t.band, d, Inf)
+Tophat(band)      = Distributions.Uniform(-band, +band)
 Gaussian(band)    = Distributions.Normal(0, band)
-Exponential(band) = Distributions.Laplace(0, band)
+Exponential(band) = Distributions.Exponential(band)
+Triangular(band)  = Distributions.SymTriangularDist(0, band)
 
-_lognormalisation(::Distributions.Normal, ::Val{d}) where d = (1-d) * (log(2) + log(pi))
-(g::Normal)(x) = exp(sum(logpdf.(Normal(0, g.band), x)))
-
-mutable struct Triangular <: AbstractKernel
-    band::Real
+struct Epanechnikov <: ContinuousUnivariateDistribution
+    b::Real
 end
 
-(t::Triangular)(x) = norm(x / t.band, 1) <= 1 ? 1 - nx : 0
+Distributions.pdf(e::Epanechnikov,    x::Real) = abs(x/e.b) < 1 ? 3/(4b)*(1 - (x/e.b)^2) : 0
+Distributions.logpdf(e::Epanechnikov, x::Real) = abs(x/e.b) < 1 ? log(3) + log1p(-(x/e.b)^2) - log(4) - log(e.b) : -Inf
 
+struct Cosine <: ContinuousUnivariateDistribution
+    b::Real
+end
 
-lognormalisation(k, d::Int) = _lognormalisation(k, Val{d}())
+Distributions.pdf(d::Cosine,    x::Real) = abs(x/e.b) <= 1 ? pi/(4d.b) * cospi(x/(4d.b)) : 0
+Distributions.logpdf(d::Cosine, x::Real) = abs(x/d.b) <= 1 ? log(pi) - log(4) - log(d.b) + log(cospi(x/(4d.b))) : -Inf
 
-struct KernelDensity{d} <: ContinuousMultivariateDistribution
-    kernel::K
-    data::AbstractMatrix
+bandwidth(::Distributions.Uniform, band)            = Distributions.Uniform(-band, +band)
+bandwidth(::Distributions.Normal, band)             = Distributions.Normal(0, band)
+bandwidth(::Distributions.Exponential, band)        = Distributions.Exponential(band)
+bandwidth(::Distributions.SymTriangularDist, band)  = Distributions.SymTriangularDist(0, band)
+bandwidth(::Epanechnikov, band)                     = Epanechnikov(band)
+bandwidth(::Cosine, band)                           = Cosine(band)
+supported_kernels = (Epanechnikov, Gaussian, Tophat, Exponential, Cosine, Triangular)
+
+struct KernelDensity <: ContinuousMultivariateDistribution
+    kernel::Kernel
+    data::AbstractArray
     weights::AbstractVector
     
-    function KernelDensity(kernel::AbstractKernel, data::AbstractArray, weights::AbstractVector)
+    function KernelDensity(kernel, data, weights)
         size(data, ndims(data)) == length(weights) || throw("must have the same number of data ($(size(data, 2))) and weights ($(length(weights)))")
-        all(w >= 0 for w in weights)     || throw("weights must all be nonnegative")
+        all(w >= 0 for w in weights) || throw("weights must all be nonnegative")
         s = sum(weights)
         if !isapprox(s, 1) 
             weights ./= s
         end
-        d = size(data, 1)
-        return new{d}(kernel, data, weights)
+        return new(kernel, data, weights)
     end
 end
 
-KernelDensity(kernel::AbstractKernel, data::AbstractArray) = KernelDensity(kernel, data, fill(1/size(data, ndims(data)), size(data, ndims(data))))
+function KernelDensity(kernel::Kernel, data::AbstractArray)
+    weights = fill(1/size(data, ndims(data)), size(data, ndims(data)))
+    KernelDensity(kernel, data, weights)
+end
 
-function Distributions.pdf(k::KernelDensity{d}, x::Union{Real, AbstractVector})
+function Distributions.pdf(k::KernelDensity, x::AbstractVector)
     size(x, 1) == size(k.data, 1) || throw("incorrectly sized input with dimension $(size(x, 1)); expected $(size(k.data, 1))")
     density = zero(Float64)
     @inbounds for i in Base.OneTo(size(k.data, ndims(k.data)))
         density += eval_kernel(k.kernel, x, k.data[:,i]) * k.weights[i]
     end
-    return exp(log(density) - lognormalisation(k, d))
+    return density
 end
 
 function Distributions.pdf(k::KernelDensity, x::AbstractMatrix)
     n = size(x, 2)
     density = Vector{Float64}(n)
     Threads.@threads for i in 1:n
-        @inbounds density[i] = pdf(k, x[:,i])
+        density[i] = pdf(k, x[:,i])
     end
     return density
 end
 
-Distributions.logpdf(k::KernelDensity, x) = log.(pdf(k, x))
+function Base.rand(k::KernelDensity)
+    i = rand(Distributions.Categorical(k.weights))
+    return rand(k.kernel, size(k.kernel, 2)) + k.data[:,i]
+end
+
+function Base.rand!(k::KernelDensity, result::AbstractMatrix{T}) where T<:Real
+    return reshape(rand(k.kernel, length(result)), size(result)) 
+end
+
+Distributions.logpdf(k::KernelDensity, x::AbstractMatrix) = log.(pdf(k, x))
 
 using MLDataUtils
 
 scott(d, n)::Float64     = n^(-1/(d + 4))
 silverman(d, n)::Float64 = (n*(d + 2)/4)^(-1/(d + 4))
 
-bandwidth!(k::AbstractKernel, band) = (k.band = band; return k)
-bandwidth!(k::KernelDensity,  band) = bandwidth!(k.kernel, band)
-
-function kde(data, weights = fill(1/size(data,2), size(data,2)); 
+function kde(data, weights = fill(1/size(data, ndims(data)), size(data, ndims(data))); 
              band::Union{Real, typeof(scott), typeof(silverman)} = scott, 
-             kernel::Union{K, Type{K}} = Gaussian, 
+             kernel = Gaussian, 
              cross_validate = false, 
              folds = 10, 
-             δ = 2) where K <: AbstractKernel
+             δ = 2)
 
-    band::Real             = isa(band, Real) ? band : band(size(data)...)
-    kernel::AbstractKernel = isa(kernel, AbstractKernel) ? kernel : kernel(band)
+    band::Real = isa(band, Real) ? band : band(size(data)...)
+    kernel::Kernel = isa(kernel, Kernel) ? kernel : kernel(band)
 
     k = KernelDensity(kernel, data, weights)
 
-    if cross_validate
+    if !cross_validate
+        return k
+    else
         results    = zeros(Float64, folds)
-        bandwidths = linspace(max(eps(), kernel.band - δ), kernel.band + δ, folds)
+        densities  = Vector{KernelDensity}(folds)
+        bandwidths = vcat(linspace(max(0, band - δ), band + δ, folds)[2:end], band)
         for (i, b) in enumerate(bandwidths) 
             for (train_idx, valid_idx) in kfolds(size(data, 2), folds)
-                bandwidth!(kernel, b)
-                k           = KernelDensity(kernel, data[:, train_idx], weights[train_idx])
-                results[i] += sum(logpdf(k, data[:, valid_idx]))
+                densities[i] = KernelDensity(bandwidth(kernel, b), data[:, train_idx], weights[train_idx])
+                results[i]  += sum(logpdf(k, data[:, valid_idx]))
             end
         end
         _, mx = findmax(results)
-        if mx == 1 || mx == folds 
-            # if likelihood is maximised by either the first or last bandwidth in the search
-            warn("a better model may be achieved by increasing δ")
-        end
-        k.kernel.band = bandwidths[mx]
+        return densities[mx]
     end
-    
-    return KernelDensity(kernel, data, weights)
 end
 
 
-export Gaussian, Normal, Exponential, Laplace, Ball, Tophat, Laplace, KernelDensity, Exponential, KernelDensity, kde, pdf, scott, silverman
+export Epanechnikov, Gaussian, Normal, Exponential, Triangular, Tophat, KernelDensity, kde, pdf, scott, silverman
  
 
 end # module
