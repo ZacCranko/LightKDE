@@ -18,19 +18,19 @@ Gaussian(band)    = Distributions.Normal(0, band)
 Exponential(band) = Distributions.Exponential(band)
 Triangular(band)  = Distributions.SymTriangularDist(0, band)
 
-struct Epanechnikov <: ContinuousUnivariateDistribution
+struct Epanechnikov <: Kernel
     b::Real
 end
 
 Distributions.pdf(e::Epanechnikov,    x::Real) = abs(x/e.b) < 1 ? 3/(4b)*(1 - (x/e.b)^2) : 0
 Distributions.logpdf(e::Epanechnikov, x::Real) = abs(x/e.b) < 1 ? log(3) + log1p(-(x/e.b)^2) - log(4) - log(e.b) : -Inf
 
-struct Cosine <: ContinuousUnivariateDistribution
+struct Cosine <: Kernel
     b::Real
 end
 
-Distributions.pdf(d::Cosine,    x::Real) = abs(x/e.b) <= 1 ? pi/(4d.b) * cospi(x/(4d.b)) : 0
-Distributions.logpdf(d::Cosine, x::Real) = abs(x/d.b) <= 1 ? log(pi) - log(4) - log(d.b) + log(cospi(x/(4d.b))) : -Inf
+Distributions.pdf(d::Cosine,    x::Real) = abs(x/e.b) < 1 ? pi/(4d.b) * cospi(x/(4d.b)) : 0
+Distributions.logpdf(d::Cosine, x::Real) = abs(x/d.b) < 1 ? log(pi) - log(4) - log(d.b) + log(cospi(x/(4d.b))) : -Inf
 
 bandwidth(::Distributions.Uniform, band)            = Distributions.Uniform(-band, +band)
 bandwidth(::Distributions.Normal, band)             = Distributions.Normal(0, band)
@@ -73,20 +73,23 @@ end
 function Distributions.pdf(k::KernelDensity, x::AbstractMatrix)
     n = size(x, 2)
     density = Vector{Float64}(n)
-    Threads.@threads for i in 1:n
-        density[i] = pdf(k, x[:,i])
+    Threads.@threads for i in Base.OneTo(n)
+        @inbounds density[i] = pdf(k, x[:,i])
     end
     return density
 end
 
-function Base.rand(k::KernelDensity)
-    i = rand(Distributions.Categorical(k.weights))
-    return rand(k.kernel, size(k.kernel, 2)) + k.data[:,i]
+function Base.rand!(k::KernelDensity, result::AbstractMatrix{T}) where T<:Real
+    d, n = size(result)
+    @assert d == size(k.data, 1)
+    for (i,ind) in enumerate(rand(Categorical(k.weights), n))
+        @inbounds result[:, i] = k.data[:, ind]
+    end
+    result[:] += rand(k.kernel, length(result))
+    return result
 end
 
-function Base.rand!(k::KernelDensity, result::AbstractMatrix{T}) where T<:Real
-    return reshape(rand(k.kernel, length(result)), size(result)) 
-end
+Base.rand(k::KernelDensity, n::Int = 1) = Base.rand!(k, similar(k.data, (size(k.data, 1),n)))
 
 Distributions.logpdf(k::KernelDensity, x::AbstractMatrix) = log.(pdf(k, x))
 
